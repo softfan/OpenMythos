@@ -4,4 +4,4 @@ datasets>=2.18.0
 pytest>=7.0.0
 
 # optional — enables Flash Attention 2 in GQAttention (requires CUDA + build tools)
-# flash-attn>=2.8.3
+flash-attn>=2.8.3
