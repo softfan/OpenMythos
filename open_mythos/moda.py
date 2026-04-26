@@ -26,7 +26,7 @@ Gate routing (faithful to DeepSeek-V3 model.py)
 ------------------------------------------------
   scores       = softmax(x W^T)          # or sigmoid for V3 style
   original     = scores                  # saved for weight computation
-  [optional]   scores += bias            # V3 aux-loss-free routing
+  [optional]   scores += bias            # V3 aux-loss-free routing bias
   [optional]   group-limited masking     # V3 device-group routing
   indices      = topk(scores, K)
   weights      = original[indices]       # un-biased original scores
@@ -38,6 +38,20 @@ Balance loss (DeepSeekMoE §3.3, used when training without V3 bias routing)
   f_i = (N_r / (K · T)) · #{tokens routing to i}   (normalised frequency)
   P_i = (1/T) Σ_t s_{i,t}                          (mean soft gate score)
 
+Safe instrumentation / validation updates
+-----------------------------------------
+This version keeps the file standalone and does **not** import the FPF registry.
+It only adds low-risk operational improvements:
+
+  * `MoDAConfig.__post_init__` validation for shape/routing invariants.
+  * Optional V3-style non-gradient routing bias via `moe_use_bias`.
+  * MoE routing metrics:
+      - `expert_entropy`
+      - `expert_gini`
+      - `max_expert_fraction`
+  * `MoDAModel.last_metrics` and optional `return_aux=True`.
+  * Safer `.reshape(...)` in LM loss and explicit cos/sin device/dtype casting.
+
 Memory note
 -----------
 MoDA's unified attention has O(T·L) combined KV length.  For long sequences
@@ -48,7 +62,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -67,6 +81,7 @@ class MoDAConfig:
     n_heads_q:         Query heads.
     n_heads_kv:        Key/value heads for GQA (must divide n_heads_q).
     head_dim:          Per-head dimension (usually d_model // n_heads_q).
+                       Must be even because RoPE rotates feature pairs.
     max_seq_len:       Maximum sequence length for the RoPE cache.
     rope_base:         RoPE frequency base.
     attn_dropout:      Attention dropout (0 for inference).
@@ -79,19 +94,23 @@ class MoDAConfig:
     n_routed_experts:     Total pool of routed experts (N_r).
     n_activated_experts:  Top-K selected from routed experts per token (K').
     expert_hidden_dim:    Per-expert intermediate dimension.
-                          Set to  dense_ffn_hidden / m  where m is the
+                          Set to dense_ffn_hidden / m where m is the
                           fine-grained segmentation factor so that total
                           activated FLOPs match a dense FFN:
-                          (n_shared + n_activated) × expert_hidden ≈ dense_hidden
-    moe_balance_alpha:    Weight of the expert-level balance loss.  Set to
-                          0.0 to disable (e.g. when using V3 bias routing).
+                          (n_shared + n_activated) × expert_hidden ≈ dense_hidden.
+    moe_balance_alpha:    Weight of the expert-level balance loss. Set to
+                          0.0 to disable, especially when using V3-style
+                          aux-loss-free bias routing.
     moe_score_func:       "softmax" (DeepSeekMoE / V2) or "sigmoid" (V3).
-    moe_n_groups:         Number of expert groups for group-limited routing
-                          (V3 uses 8; set 1 to disable, default).
-    moe_topk_groups:      Number of groups a token may route to
-                          (V3 uses 3; set 1 to disable, default).
+    moe_n_groups:         Number of expert groups for group-limited routing.
+                          Set to 1 to disable grouping.
+    moe_topk_groups:      Number of groups a token may route to when grouping
+                          is enabled. Must be in [1, moe_n_groups].
     moe_route_scale:      Scalar multiplied onto the selected gate weights
                           after normalisation (V3 uses 2.5446; default 1.0).
+    moe_use_bias:         If True, use a non-gradient per-expert routing bias.
+                          This bias affects top-K selection only; gate weights
+                          still come from the original un-biased scores.
 
     Defaults approximate the DeepSeekMoE 2B configuration scaled to
     d_model = 2048, keeping per-token FLOPs equal to a dense SwiGLU with
@@ -121,6 +140,60 @@ class MoDAConfig:
     moe_n_groups: int = 1  # expert groups (1 = no grouping)
     moe_topk_groups: int = 1  # groups to route into (1 = no limit)
     moe_route_scale: float = 1.0  # gate-weight scale factor
+    moe_use_bias: bool = False  # V3 aux-loss-free routing bias
+
+    def __post_init__(self) -> None:
+        """Validate configuration invariants at construction time.
+
+        These checks are intentionally conservative and only cover shape,
+        routing, and numerical invariants required for the implementation to
+        run correctly.
+        """
+        if self.vocab_size <= 0:
+            raise ValueError("vocab_size must be positive.")
+        if self.d_model <= 0:
+            raise ValueError("d_model must be positive.")
+        if self.n_layers <= 0:
+            raise ValueError("n_layers must be positive.")
+        if self.n_heads_q <= 0 or self.n_heads_kv <= 0:
+            raise ValueError("n_heads_q and n_heads_kv must be positive.")
+        if self.head_dim <= 0:
+            raise ValueError("head_dim must be positive.")
+        if self.d_model != self.n_heads_q * self.head_dim:
+            raise ValueError("d_model must equal n_heads_q * head_dim.")
+        if self.n_heads_q % self.n_heads_kv != 0:
+            raise ValueError("n_heads_q must be divisible by n_heads_kv.")
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE.")
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive.")
+        if not (0.0 <= self.attn_dropout < 1.0):
+            raise ValueError("attn_dropout must be in [0, 1).")
+        if self.norm_eps <= 0:
+            raise ValueError("norm_eps must be positive.")
+
+        if self.n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be non-negative.")
+        if self.n_routed_experts <= 0:
+            raise ValueError("n_routed_experts must be positive.")
+        if self.n_activated_experts <= 0:
+            raise ValueError("n_activated_experts must be positive.")
+        if self.n_activated_experts > self.n_routed_experts:
+            raise ValueError("n_activated_experts cannot exceed n_routed_experts.")
+        if self.expert_hidden_dim <= 0:
+            raise ValueError("expert_hidden_dim must be positive.")
+        if self.moe_balance_alpha < 0:
+            raise ValueError("moe_balance_alpha must be non-negative.")
+        if self.moe_score_func not in {"softmax", "sigmoid"}:
+            raise ValueError("moe_score_func must be 'softmax' or 'sigmoid'.")
+        if self.moe_n_groups <= 0:
+            raise ValueError("moe_n_groups must be positive.")
+        if self.n_routed_experts % self.moe_n_groups != 0:
+            raise ValueError("n_routed_experts must be divisible by moe_n_groups.")
+        if not (1 <= self.moe_topk_groups <= self.moe_n_groups):
+            raise ValueError("moe_topk_groups must be in [1, moe_n_groups].")
+        if self.moe_route_scale <= 0:
+            raise ValueError("moe_route_scale must be positive.")
 
 
 # ---------------------------------------------------------------------------
@@ -171,14 +244,16 @@ class RotaryEmbedding(nn.Module):
         """Initialise RoPE and pre-compute the cos/sin cache.
 
         Args:
-            dim:         Per-head dimension.  Must be even.
-            max_seq_len: Number of positions to cache on construction.  The
+            dim:         Per-head dimension. Must be even.
+            max_seq_len: Number of positions to cache on construction. The
                          cache doubles automatically when a longer sequence
                          is encountered.
-            base:        Frequency base θ.  Higher values slow the rotation
+            base:        Frequency base θ. Higher values slow the rotation
                          rate, extending effective context length.
         """
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("RoPE dim must be even.")
         self.dim = dim
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -220,7 +295,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Return *x* with its last dimension split and swapped with negation.
 
     Given ``x = [x₁, x₂]`` (each half of the last dim), returns
-    ``[-x₂, x₁]``.  Combined with the cos/sin multiply in
+    ``[-x₂, x₁]``. Combined with the cos/sin multiply in
     :func:`apply_rotary_emb` this implements the 2-D rotation matrix
     that defines RoPE.
 
@@ -252,7 +327,7 @@ def apply_rotary_emb(
     Returns:
         Rotated tensor with the same shape and dtype as *x*.
     """
-    return x * cos + _rotate_half(x) * sin
+    return (x * cos + _rotate_half(x) * sin).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +354,7 @@ class DeepSeekExpert(nn.Module):
 
         Args:
             d_model:    Token hidden dimension (input and output size).
-            hidden_dim: Expert intermediate dimension.  Typically much
+            hidden_dim: Expert intermediate dimension. Typically much
                         smaller than the dense FFN hidden dim — set to
                         ``dense_hidden / m`` where *m* is the fine-grained
                         segmentation factor so total activated FLOPs match
@@ -330,11 +405,13 @@ class DeepSeekGate(nn.Module):
         n_routed_experts:  Total routed expert pool size (N_r).
         n_activated:       Top-K experts to select (K').
         score_func:        ``"softmax"`` or ``"sigmoid"``.
-        n_groups:          Number of expert groups (1 = disabled).
-        topk_groups:       Groups a token may route to (1 = disabled).
+        n_groups:          Number of expert groups. Set to 1 to disable grouping. Set to 1 to disable (default).
+        topk_groups:       Groups a token may route to when grouping is enabled. Set to 1 to disable (default).
         route_scale:       Scalar applied to final gate weights.
-        use_bias:          If True, add a learnable per-expert bias used only
-                           for the routing decision (V3 aux-loss-free scheme).
+        use_bias:          If True, add a non-gradient per-expert bias used only
+                           for the routing decision. This supports V3-style
+                           aux-loss-free load balancing where the bias is
+                           adjusted outside the optimizer to track expert loads.
     """
 
     def __init__(
@@ -357,19 +434,33 @@ class DeepSeekGate(nn.Module):
             score_func:       Affinity function — ``"softmax"`` (original
                               DeepSeekMoE / V2) or ``"sigmoid"`` (V3).
             n_groups:         Number of expert groups for device-limited
-                              routing.  Set to 1 to disable (default).
-            topk_groups:      Number of groups each token may route into.
-                              Set to 1 to disable (default).
+                              routing. Set to 1 to disable grouping.
+            topk_groups:      Number of groups each token may route into when
+                              grouping is enabled. Set to 1 to disable (default).
             route_scale:      Scalar multiplied onto gate weights after
                               optional sigmoid normalisation (V3 uses 2.5446;
                               default 1.0 leaves weights unchanged).
-            use_bias:         If ``True``, initialise a learnable per-expert
+            use_bias:         If ``True``, initialise a non-gradient per-expert
                               float32 bias added to routing scores only (not
-                              gate weights).  Enables the V3 aux-loss-free
-                              load-balancing scheme where the bias is adjusted
-                              outside the optimizer to track expert loads.
+                              gate weights). This bias is stored as a buffer
+                              and should be updated outside the optimizer.
         """
         super().__init__()
+        if score_func not in {"softmax", "sigmoid"}:
+            raise ValueError("score_func must be 'softmax' or 'sigmoid'.")
+        if n_routed_experts <= 0:
+            raise ValueError("n_routed_experts must be positive.")
+        if n_activated <= 0 or n_activated > n_routed_experts:
+            raise ValueError("n_activated must be in [1, n_routed_experts].")
+        if n_groups <= 0:
+            raise ValueError("n_groups must be positive.")
+        if n_routed_experts % n_groups != 0:
+            raise ValueError("n_routed_experts must be divisible by n_groups.")
+        if not (1 <= topk_groups <= n_groups):
+            raise ValueError("topk_groups must be in [1, n_groups].")
+        if route_scale <= 0:
+            raise ValueError("route_scale must be positive.")
+
         self.n_routed_experts = n_routed_experts
         self.n_activated = n_activated
         self.score_func = score_func
@@ -382,13 +473,16 @@ class DeepSeekGate(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
         # Optional per-expert routing bias (V3 aux-loss-free load balancing).
-        # Updated outside the optimizer by monitoring expert loads — not trained
-        # through the balance loss.  Initialised to zero.
-        self.bias: Optional[nn.Parameter] = (
-            nn.Parameter(torch.zeros(n_routed_experts, dtype=torch.float32))
-            if use_bias
-            else None
-        )
+        # This is a buffer, not a trainable Parameter: it is updated outside
+        # the optimizer by monitoring expert loads.
+        if use_bias:
+            self.register_buffer(
+                "bias",
+                torch.zeros(n_routed_experts, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            self.bias: Optional[torch.Tensor] = None
 
     def forward(
         self, x: torch.Tensor
@@ -399,9 +493,9 @@ class DeepSeekGate(nn.Module):
             x: ``[num_tokens, d_model]`` (flattened B × T).
 
         Returns:
-            weights:        ``[num_tokens, K']``  gate weights (dtype = x.dtype).
-            indices:        ``[num_tokens, K']``  selected expert indices (int64).
-            original_scores: ``[num_tokens, N_r]``  full soft scores (float32),
+            weights:         ``[num_tokens, K']`` gate weights (dtype = x.dtype).
+            indices:         ``[num_tokens, K']`` selected expert indices (int64).
+            original_scores: ``[num_tokens, N_r]`` full soft scores (float32),
                              used by :class:`DeepSeekMoE` for the balance loss.
         """
         # Affinity logits
@@ -426,8 +520,11 @@ class DeepSeekGate(nn.Module):
             if self.bias is None:
                 group_scores = g.amax(dim=-1)  # [T, G]
             else:
-                # Top-2 sum per group (V3 heuristic)
-                group_scores = g.topk(2, dim=-1)[0].sum(dim=-1)
+                # Top-2 sum per group (V3 heuristic). Use min(2, group_size)
+                # so validation remains robust for tiny test configurations.
+                k_group = min(2, g.shape[-1])
+                group_scores = g.topk(k_group, dim=-1)[0].sum(dim=-1)
+
             _, top_groups = group_scores.topk(self.topk_groups, dim=-1)  # [T, topk_g]
             mask = torch.ones(
                 x.size(0), self.n_groups, dtype=torch.bool, device=x.device
@@ -447,6 +544,35 @@ class DeepSeekGate(nn.Module):
 
         weights = (weights * self.route_scale).to(x.dtype)
         return weights, indices, original_scores
+
+
+def _entropy_from_counts(counts: torch.Tensor) -> torch.Tensor:
+    """Compute normalized routing entropy from per-expert token counts.
+
+    Returns a scalar in [0, 1] when counts are non-negative:
+      * 0 means all routed tokens go to one expert.
+      * 1 means perfectly uniform routing.
+
+    This is safe instrumentation for MoE expert-collapse detection.
+    """
+    total = counts.sum().clamp(min=1)
+    p = (counts.float() / total).clamp(min=1e-12)
+    return -(p * p.log()).sum() / math.log(max(2, counts.numel()))
+
+
+def _gini_from_counts(counts: torch.Tensor) -> torch.Tensor:
+    """Compute Gini coefficient over expert assignment counts.
+
+    Returns:
+        Scalar tensor. Higher values mean more unequal routing.
+    """
+    x = counts.float().sort()[0]
+    n = x.numel()
+    if x.sum() <= 0:
+        return torch.tensor(0.0, device=x.device)
+
+    idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+    return (2 * (idx * x).sum() / (n * x.sum())) - (n + 1) / n
 
 
 class DeepSeekMoE(nn.Module):
@@ -479,6 +605,13 @@ class DeepSeekMoE(nn.Module):
           f_i = (N_r / (K' · T)) · #{tokens → expert i}
           P_i = mean_t(scores_{t,i})
 
+    Safe instrumentation
+    ~~~~~~~~~~~~~~~~~~~~
+    After every forward pass, ``last_metrics`` contains:
+        * expert_entropy
+        * expert_gini
+        * max_expert_fraction
+
     Args:
         cfg: :class:`MoDAConfig` instance.
     """
@@ -495,12 +628,12 @@ class DeepSeekMoE(nn.Module):
             intermediate units.
 
         Args:
-            cfg: Model configuration.  The relevant fields are
+            cfg: Model configuration. The relevant fields are
                  ``n_shared_experts``, ``n_routed_experts``,
                  ``n_activated_experts``, ``expert_hidden_dim``,
                  ``moe_balance_alpha``, ``moe_score_func``,
-                 ``moe_n_groups``, ``moe_topk_groups``, and
-                 ``moe_route_scale``.
+                 ``moe_n_groups``, ``moe_topk_groups``,
+                 ``moe_route_scale``, and ``moe_use_bias``.
         """
         super().__init__()
         self.d_model = cfg.d_model
@@ -522,7 +655,7 @@ class DeepSeekMoE(nn.Module):
             n_groups=cfg.moe_n_groups,
             topk_groups=cfg.moe_topk_groups,
             route_scale=cfg.moe_route_scale,
-            use_bias=False,
+            use_bias=cfg.moe_use_bias,
         )
 
         # Routed experts pool
@@ -533,6 +666,8 @@ class DeepSeekMoE(nn.Module):
             ]
         )
 
+        self.last_metrics: Dict[str, float] = {}
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the MoE layer.
 
@@ -540,12 +675,12 @@ class DeepSeekMoE(nn.Module):
             x: ``[B, T, D]`` hidden states.
 
         Returns:
-            output:        ``[B, T, D]``  updated hidden states.
+            output:        ``[B, T, D]`` updated hidden states.
             balance_loss:  Scalar expert-level balance loss (during training),
-                           or ``None`` during inference.
+                           or ``None`` during inference / when disabled.
         """
         shape = x.shape
-        x_flat = x.view(-1, self.d_model)  # [T_tot, D]
+        x_flat = x.reshape(-1, self.d_model)  # [T_tot, D]
         n_tokens = x_flat.size(0)
 
         # ---- Shared experts (all tokens) ---------------------------------
@@ -570,6 +705,20 @@ class DeepSeekMoE(nn.Module):
 
         output = (y + z).view(shape)
 
+        # ---- Safe routing instrumentation --------------------------------
+        with torch.no_grad():
+            entropy = _entropy_from_counts(counts)
+            gini = _gini_from_counts(counts)
+            total = counts.sum().clamp(min=1)
+
+            self.last_metrics = {
+                "expert_entropy": float(entropy.detach().cpu()),
+                "expert_gini": float(gini.detach().cpu()),
+                "max_expert_fraction": float(
+                    (counts.max().float() / total).detach().cpu()
+                ),
+            }
+
         # ---- Expert-level balance loss (DeepSeekMoE §3.3) ----------------
         balance_loss: Optional[torch.Tensor] = None
         if self.training and self.moe_balance_alpha > 0.0:
@@ -586,7 +735,7 @@ class DeepSeekMoE(nn.Module):
         """Compute the expert-level balance loss (DeepSeekMoE §3.3).
 
         Penalises routing imbalance by encouraging the model to spread tokens
-        evenly across experts.  Only the soft-score term ``P_i`` receives a
+        evenly across experts. Only the soft-score term ``P_i`` receives a
         gradient; the hard-count term ``f_i`` is non-differentiable and acts
         as a fixed weighting coefficient.
 
@@ -597,9 +746,9 @@ class DeepSeekMoE(nn.Module):
             L   = Σ_i  f_i · P_i
 
         For perfect balance ``f_i = 1`` for all *i* and ``L = Σ P_i = 1``
-        (softmax) or some constant (sigmoid).  Overloaded experts produce
-        large ``f_i``, pushing their mean score ``P_i`` up via the gradient
-        and thereby attracting more tokens — stabilising load over training.
+        (softmax) or some constant (sigmoid). Overloaded experts produce
+        large ``f_i``; under gradient descent, this pushes their mean score
+        ``P_i`` downward, discouraging further overload.
 
         Args:
             indices:  ``[T, K']`` int64 — expert indices selected per token.
@@ -625,14 +774,14 @@ class DeepSeekMoE(nn.Module):
         P = scores.mean(dim=0)  # [N_r]
 
         # f is derived from hard top-K → no gradient; gradient flows through P only
-        return (f * P).sum()
+        return (f.detach() * P).sum()
 
 
 class _SharedFFN(nn.Module):
     """Dense SwiGLU FFN used for the always-active shared experts.
 
     Mirrors :class:`DeepSeekExpert` but is a single larger MLP whose
-    ``hidden_dim`` equals ``n_shared_experts × expert_hidden_dim``.  This
+    ``hidden_dim`` equals ``n_shared_experts × expert_hidden_dim``. This
     matches DeepSeek-V3's ``MLP(dim, n_shared_experts * moe_inter_dim)``.
 
     Not part of the public API — instantiated only by :class:`DeepSeekMoE`.
@@ -664,7 +813,7 @@ class _SharedFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MoDA Attention (unchanged from base file)
+# MoDA Attention
 # ---------------------------------------------------------------------------
 
 
@@ -689,7 +838,7 @@ class MoDAAttention(nn.Module):
         stores the attention scale and dropout rate.
 
         Args:
-            cfg: Model configuration.  Must satisfy
+            cfg: Model configuration. Must satisfy
                  ``n_heads_q % n_heads_kv == 0`` (GQA requirement).
 
         Raises:
@@ -756,7 +905,7 @@ class MoDAAttention(nn.Module):
         Returns:
             ``[B, T, D]`` output hidden states.
         """
-        B, T, D = x.shape
+        B, T, _ = x.shape
         Hq, Hk, d = self.n_heads_q, self.n_heads_kv, self.head_dim
 
         Q = self.q_proj(x).view(B, T, Hq, d).transpose(1, 2)
@@ -927,6 +1076,10 @@ class MoDAModel(nn.Module):
     The depth KV cache is a local list inside :meth:`forward` — never stored
     on ``self``, so autograd is clean across independent forward calls.
 
+    Safe instrumentation:
+        ``last_metrics`` is updated after every forward pass with averaged
+        MoE routing metrics across layers.
+
     Args:
         cfg: :class:`MoDAConfig` specifying the full model.
     """
@@ -935,7 +1088,7 @@ class MoDAModel(nn.Module):
         """Build the full MoDA + MoE language model.
 
         Constructs the token embedding, RoPE, all transformer blocks, a final
-        RMSNorm, and the language-model head.  The embedding and LM-head
+        RMSNorm, and the language-model head. The embedding and LM-head
         weights are tied so they share the same parameter.
 
         Args:
@@ -951,6 +1104,8 @@ class MoDAModel(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
         self.lm_head.weight = self.embed.weight  # weight tying
+
+        self.last_metrics: Dict[str, float] = {}
 
         self._init_weights()
 
@@ -977,16 +1132,31 @@ class MoDAModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return_aux: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]],
+    ]:
         """Run the full MoDA + MoE language model.
 
         Args:
-            input_ids: ``[B, T]`` token indices.
-            labels:    ``[B, T]`` targets for LM loss; -100 positions ignored.
+            input_ids:  ``[B, T]`` token indices.
+            labels:     ``[B, T]`` targets for LM loss; -100 positions ignored.
+            return_aux: If True, return a third dictionary containing safe
+                        instrumentation metrics.
 
         Returns:
-            logits:    ``[B, T, vocab_size]``.
-            loss:      ``lm_loss + balance_loss`` if labels provided, else ``None``.
+            If ``return_aux=False``:
+                logits: ``[B, T, vocab_size]``.
+                loss:   ``lm_loss + balance_loss`` if labels provided, else ``None``.
+
+            If ``return_aux=True``:
+                logits, loss, aux where ``aux["metrics"]`` contains:
+                    * expert_entropy
+                    * expert_gini
+                    * max_expert_fraction
+                    * moe_balance_loss
+                    * depth_cache_layers
         """
         B, T = input_ids.shape
         if T > self.cfg.max_seq_len:
@@ -995,34 +1165,68 @@ class MoDAModel(nn.Module):
             )
 
         x = self.embed(input_ids)
+
         cos, sin = self.rope(T)
+        # Safe dtype/device alignment for mixed precision and .to(device) models.
+        cos = cos.to(device=x.device, dtype=x.dtype)
+        sin = sin.to(device=x.device, dtype=x.dtype)
 
         depth_k_cache: List[torch.Tensor] = []
         depth_v_cache: List[torch.Tensor] = []
         balance_losses: List[torch.Tensor] = []
 
+        expert_entropies: List[float] = []
+        expert_ginis: List[float] = []
+        max_expert_fractions: List[float] = []
+
         for block in self.blocks:
             x, k_write, v_write, bal = block(x, depth_k_cache, depth_v_cache, cos, sin)
             depth_k_cache.append(k_write)
             depth_v_cache.append(v_write)
+
             if bal is not None:
                 balance_losses.append(bal)
+
+            expert_entropies.append(block.moe.last_metrics.get("expert_entropy", 0.0))
+            expert_ginis.append(block.moe.last_metrics.get("expert_gini", 0.0))
+            max_expert_fractions.append(
+                block.moe.last_metrics.get("max_expert_fraction", 0.0)
+            )
 
         x = self.norm_out(x)
         logits = self.lm_head(x)
 
+        avg_balance_loss: Optional[torch.Tensor] = None
+        if balance_losses:
+            avg_balance_loss = torch.stack(balance_losses).mean()
+
         loss: Optional[torch.Tensor] = None
         if labels is not None:
             lm_loss = F.cross_entropy(
-                logits.view(-1, self.cfg.vocab_size),
-                labels.view(-1),
+                logits.reshape(-1, self.cfg.vocab_size),
+                labels.reshape(-1),
                 ignore_index=-100,
             )
-            if balance_losses and self.cfg.moe_balance_alpha > 0.0:
-                avg_balance = torch.stack(balance_losses).mean()
-                loss = lm_loss + self.cfg.moe_balance_alpha * avg_balance
+            if avg_balance_loss is not None and self.cfg.moe_balance_alpha > 0.0:
+                loss = lm_loss + self.cfg.moe_balance_alpha * avg_balance_loss
             else:
                 loss = lm_loss
+
+        n_layers = max(1, len(self.blocks))
+        self.last_metrics = {
+            "expert_entropy": float(sum(expert_entropies) / n_layers),
+            "expert_gini": float(sum(expert_ginis) / n_layers),
+            "max_expert_fraction": float(sum(max_expert_fractions) / n_layers),
+            "moe_balance_loss": (
+                float(avg_balance_loss.detach().cpu())
+                if avg_balance_loss is not None
+                else 0.0
+            ),
+            "depth_cache_layers": float(len(depth_k_cache)),
+        }
+
+        if return_aux:
+            return logits, loss, {"metrics": dict(self.last_metrics)}
 
         return logits, loss
 

@@ -3,7 +3,14 @@ from open_mythos.main import MythosConfig
 # Parameter budget breakdown per variant:
 #   total ≈ embed + prelude/coda dense blocks + recurrent MLA + MoE
 #   MoE   = 3 * dim * expert_dim * (n_experts + n_shared * n_experts_per_tok)
-# expert_dim is solved from the residual budget after all other terms.
+#
+# Defaults keep the original architecture stable:
+#   recurrence_type="parcae"
+#   enable_moe_metrics=True
+#   enable_fpf_registry=True
+#
+# Advanced modules such as HybridRecurrence, predictive coding, AMOR, and
+# CoupledNeuromodMoR can be enabled explicitly per experiment.
 
 
 def mythos_1b() -> MythosConfig:
@@ -30,6 +37,9 @@ def mythos_1b() -> MythosConfig:
         act_threshold=0.99,
         rope_theta=500000.0,
         lora_rank=8,
+        recurrence_type="parcae",
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
@@ -57,11 +67,45 @@ def mythos_3b() -> MythosConfig:
         act_threshold=0.99,
         rope_theta=500000.0,
         lora_rank=8,
+        recurrence_type="parcae",
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
+    )
+
+
+def mythos_7b() -> MythosConfig:
+    """7B parameter config. Medium research model."""
+    return MythosConfig(
+        vocab_size=32000,
+        dim=3584,
+        n_heads=28,
+        n_kv_heads=4,
+        max_seq_len=8192,
+        max_loop_iters=20,
+        prelude_layers=2,
+        coda_layers=2,
+        attn_type="mla",
+        kv_lora_rank=512,
+        q_lora_rank=1024,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+        n_experts=96,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=5120,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=16,
+        recurrence_type="parcae",
+        hybrid_rank=64,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
 def mythos_10b() -> MythosConfig:
-    """10B parameter config. Mid-scale general model. dim=4096, 128 experts, 24 loop iters, 8k context."""
+    """10B parameter config. Mid-scale general model."""
     return MythosConfig(
         vocab_size=32000,
         dim=4096,
@@ -84,6 +128,10 @@ def mythos_10b() -> MythosConfig:
         act_threshold=0.99,
         rope_theta=500000.0,
         lora_rank=16,
+        recurrence_type="parcae",
+        hybrid_rank=64,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
@@ -111,6 +159,10 @@ def mythos_50b() -> MythosConfig:
         act_threshold=0.99,
         rope_theta=500000.0,
         lora_rank=32,
+        recurrence_type="parcae",
+        hybrid_rank=64,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
@@ -139,6 +191,10 @@ def mythos_100b() -> MythosConfig:
         rope_theta=1000000.0,
         lora_rank=64,
         max_output_tokens=131072,
+        recurrence_type="parcae",
+        hybrid_rank=96,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
@@ -167,6 +223,10 @@ def mythos_500b() -> MythosConfig:
         rope_theta=1000000.0,
         lora_rank=128,
         max_output_tokens=131072,
+        recurrence_type="parcae",
+        hybrid_rank=128,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )
 
 
@@ -195,4 +255,8 @@ def mythos_1t() -> MythosConfig:
         rope_theta=2000000.0,
         lora_rank=256,
         max_output_tokens=131072,
+        recurrence_type="parcae",
+        hybrid_rank=128,
+        enable_moe_metrics=True,
+        enable_fpf_registry=True,
     )

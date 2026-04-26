@@ -1,3 +1,9 @@
+# OpenMythos with FPF
+
+OpenMythos architecture (based on looped/recurrent-depth transformers with elements of predictive coding, neuromodulation, metacognition, cognitive bias mitigation, and MoE) with the First Principles Framework (FPF) principles, focusing on addressing 10 FPF SoTA logic defects, 15 proposed improvements from neurobiology/cognitive psychology/anti-bias techniques, and current code engineering deficits in OpenMythos
+
+----
+
 # OpenMythos
 
 <p align="left">
