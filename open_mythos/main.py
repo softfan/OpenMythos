@@ -1633,13 +1633,23 @@ class LTIInjection(nn.Module):
             dim -- hidden state dimension; one scalar per channel for A and B
         """
         super().__init__()
-        self.log_A = nn.Parameter(torch.zeros(dim))
-        self.log_dt = nn.Parameter(torch.zeros(1))
+        self.log_A = nn.Parameter(torch.zeros(dim))  # log of A_continuous magnitude
+        self.log_dt = nn.Parameter(torch.zeros(1))  # log of discretization step Δt
         self.B = nn.Parameter(torch.ones(dim) * 0.1)
         self.e_norm = RMSNorm(dim) if input_norm else nn.Identity()
         self.last_spec_loss: torch.Tensor = torch.tensor(0.0)
 
     def get_A(self) -> torch.Tensor:
+        """
+        Compute the discretized diagonal state matrix A_discrete.
+
+        Returns:
+            1-D tensor of shape (dim,) with all values strictly in (0, 1),
+            guaranteeing ρ(A) < 1 regardless of learned parameter values.
+        """
+        # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
+        # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
+        # Clamp keeps the product finite in float32 for any gradient step size.
         return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
 
     def spectral_radius(self) -> float:
@@ -1652,6 +1662,17 @@ class LTIInjection(nn.Module):
         e: torch.Tensor,
         transformer_out: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Compute h_{t+1} = A·h_t + B·e + transformer_out.
+
+        Args:
+            h               -- current hidden state (B, T, dim)
+            e               -- encoded input from Prelude, frozen across loops (B, T, dim)
+            transformer_out -- output of the recurrent TransformerBlock at this step (B, T, dim)
+
+        Returns:
+            Updated hidden state of shape (B, T, dim)
+        """
         A = self.get_A().to(device=h.device, dtype=h.dtype)
         B = self.B.to(device=h.device, dtype=h.dtype)
         e_inj = self.e_norm(e)
@@ -1822,22 +1843,6 @@ class RecurrentBlock(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
-        """
-        Run the recurrent loop for up to n_loops iterations with ACT early exit.
-
-        Args:
-            h        -- initial hidden state from the Prelude, shape (B, T, dim)
-            e        -- encoded input frozen for injection each step, shape (B, T, dim)
-            freqs_cis-- precomputed RoPE frequencies
-            mask     -- additive causal mask or None
-            n_loops  -- number of loop iterations; defaults to cfg.max_loop_iters.
-                        Can be increased at inference for deeper reasoning.
-            kv_cache -- cache dict passed through to the inner TransformerBlock;
-                        each loop iteration uses a separate cache key
-
-        Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
-        """
         n_loops = int(n_loops or self.cfg.max_loop_iters)
         B, T, _ = h.shape
 
@@ -1890,12 +1895,6 @@ class RecurrentBlock(nn.Module):
             p = p.clamp(1e-6, 1.0)
 
             still_running = ~halted
-
-            # ACT remainder trick: once cumulative_p + p crosses threshold,
-            # assign the remaining probability mass as the final weight.
-            # Gate by still_running so halted positions contribute exactly
-            # once (on the halting step) and zero thereafter — otherwise
-            # threshold<1 leaves a non-zero remainder that leaks every step.
             remainder = (1.0 - cumulative_p).clamp(min=0.0, max=1.0)
 
             weight = torch.where(
@@ -1911,15 +1910,10 @@ class RecurrentBlock(nn.Module):
             cumulative_p = cumulative_p + p.float() * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
-            # Only short-circuit when there is no KV cache to keep consistent.
-            # With a cache, every loop depth must run on every forward pass so
-            # later decode steps find populated keys at every cache_key.
+            # With kv_cache, all loop depths must populate deterministic cache keys.
             if halted.all() and kv_cache is None:
                 break
 
-        # If some positions never halted within n_loops, assign the remaining
-        # ACT mass to the final state. This makes the ACT-weighted output sum
-        # close to 1.0 per position even when max_loop_iters is too small.
         still_running = ~halted
         if still_running.any():
             remainder = (1.0 - loop_weights_sum).clamp(min=0.0, max=1.0)
@@ -1982,26 +1976,10 @@ class OpenMythos(nn.Module):
              ↓
         RMSNorm + tied LM head
 
-    Key properties:
-    - Same weights, more loops → deeper reasoning, no parameter growth
-    - Depth extrapolation: train on N loops, test on N+k loops
-    - ACT halting: variable compute per position within a batch
-    - MoE FFN in the recurrent block: breadth across domains
-    - LTI-stable injection: spectral radius < 1 guaranteed by construction
-    - Supports both GQA and MLA attention (set via cfg.attn_type)
-
-    Safe instrumentation:
-    - collect_metrics() exposes latest recurrent/MoE/ACT/LTI metrics.
-    - forward(..., return_aux=True) returns logits plus metrics and aux loss.
-
     FPF extensions are optional and disabled by default unless set in config.
     """
 
     def __init__(self, cfg: MythosConfig):
-        """
-        Args:
-            cfg -- MythosConfig specifying all architecture hyperparameters
-        """
         super().__init__()
         cfg.validate()
         self.cfg = cfg
@@ -2120,24 +2098,9 @@ class OpenMythos(nn.Module):
         kv_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Build an additive causal mask: 0 for visible keys, -inf for future keys.
+        Build additive causal mask broadcastable over (B, H, T, S).
 
-        This supports both:
-            1. Standard full-context training/prefill:
-                   start_pos=0, kv_len=seq_len -> square lower-triangular mask.
-            2. Chunked decoding with a cache:
-                   query positions are start_pos..start_pos+seq_len-1,
-                   key positions are 0..kv_len-1.
-
-        Args:
-            seq_len   -- query sequence length
-            device    -- target device
-            dtype     -- tensor dtype, matching activation dtype to avoid upcasts
-            start_pos -- global position of the first query token
-            kv_len    -- total key length S; defaults to seq_len
-
-        Returns:
-            Tensor of shape (1, 1, seq_len, kv_len), broadcastable over (B, H, T, S)
+        Supports chunked decoding by allowing start_pos and kv_len.
         """
         S = kv_len if kv_len is not None else seq_len
 
@@ -2158,18 +2121,6 @@ class OpenMythos(nn.Module):
     ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Forward pass through Prelude -> Recurrent Block -> Coda.
-
-        Args:
-            input_ids -- token indices of shape (B, T)
-            n_loops   -- recurrent loop depth; defaults to cfg.max_loop_iters.
-                         Increase at inference to extrapolate to harder problems.
-            kv_cache  -- dict mutated in-place for autoregressive KV caching;
-                         pass an empty dict {} and reuse across decode steps
-            start_pos -- index of the first token in input_ids within the full
-                         sequence; used to select the correct RoPE frequencies
-                         during incremental decoding
-            return_aux-- if True, return (logits, aux_dict) where aux_dict contains
-                         read-only metrics and auxiliary loss placeholders
 
         If return_aux=True, returns (logits, aux_dict), where aux_dict contains
         auxiliary losses, runtime metrics, and D1-D10 FPF metrics.
@@ -2280,27 +2231,7 @@ class OpenMythos(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
     ) -> torch.Tensor:
-        """
-        Autoregressive token generation with KV caching.
-
-        On step 0 the full prompt is processed. On subsequent steps only the
-        last generated token is passed, with all previous keys and values
-        retrieved from kv_cache. This keeps decode cost proportional to one
-        token per step rather than the full growing sequence.
-
-        n_loops can be set higher than the training value to extrapolate to
-        harder problems at inference time.
-
-        Args:
-            input_ids      -- prompt token indices of shape (B, T)
-            max_new_tokens -- number of tokens to generate
-            n_loops        -- recurrent loop depth for each decode step
-            temperature    -- softmax temperature; lower = more greedy
-            top_k          -- restrict sampling to top-K logits (0 = disabled)
-
-        Returns:
-            Token indices of shape (B, T + max_new_tokens)
-        """
+        """Autoregressive token generation with KV caching."""
         if temperature <= 0:
             raise ValueError("temperature must be > 0.")
         if max_new_tokens > self.cfg.max_output_tokens:
@@ -2308,23 +2239,11 @@ class OpenMythos(nn.Module):
                 f"max_new_tokens={max_new_tokens} exceeds "
                 f"cfg.max_output_tokens={self.cfg.max_output_tokens}"
             )
-        if input_ids.shape[1] + max_new_tokens > self.cfg.max_seq_len:
-            raise ValueError(
-                f"Prompt length + max_new_tokens = {input_ids.shape[1] + max_new_tokens} "
-                f"exceeds max_seq_len={self.cfg.max_seq_len}."
-            )
-        if temperature <= 0:
-            raise ValueError("temperature must be > 0.")
-        if n_loops <= 0:
-            raise ValueError("n_loops must be positive.")
 
-        was_training = self.training
         self.eval()
-
         kv_cache: dict = {}
         prompt_len = input_ids.shape[1]
 
-        try:
         for step in range(max_new_tokens):
             if step == 0:
                 cur_ids = input_ids
@@ -2349,7 +2268,5 @@ class OpenMythos(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
-        finally:
-            self.train(was_training)
 
         return input_ids
